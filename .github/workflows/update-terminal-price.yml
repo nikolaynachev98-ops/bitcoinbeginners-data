@@ -25,32 +25,62 @@ jobs:
           from urllib.request import Request, urlopen
           from urllib.parse import urlencode
 
+          FETCH_TERMINAL = False
+          FETCH_TRANSFER = True
+
           TOKEN = os.environ.get('BGEOMETRICS_TOKEN', '')
-          BASE_URL = 'https://api.bitcoin-data.com/v1/terminal-price'
 
-          all_records = []
-          page = 1
-          size = 5000
+          def fetch_all(endpoint):
+              base = 'https://api.bitcoin-data.com/v1/' + endpoint
+              all_records = []
+              page = 1
+              size = 5000
+              while True:
+                  url = base + '?' + urlencode({'page': page, 'size': size})
+                  req = Request(url)
+                  if TOKEN:
+                      req.add_header('Authorization', 'Bearer ' + TOKEN)
+                  with urlopen(req, timeout=30) as resp:
+                      data = json.loads(resp.read().decode())
+                  if not data:
+                      break
+                  all_records.extend(data)
+                  print(f'{endpoint} page {page}: {len(data)} records')
+                  if len(data) < size:
+                      break
+                  page += 1
+              return all_records
 
-          while True:
-              url = BASE_URL + '?' + urlencode({'page': page, 'size': size})
-              req = Request(url)
-              if TOKEN:
-                  req.add_header('Authorization', 'Bearer ' + TOKEN)
-              with urlopen(req, timeout=30) as resp:
-                  data = json.loads(resp.read().decode())
-              if not data:
-                  break
-              all_records.extend(data)
-              print(f'Page {page}: {len(data)} records (total: {len(all_records)})')
-              if len(data) < size:
-                  break
-              page += 1
+          # Load existing file so skipped endpoints keep their stored values
+          try:
+              with open('terminal-price.json') as f:
+                  existing = {r['d']: r for r in json.load(f)}
+          except Exception:
+              existing = {}
+
+          terminal_data = fetch_all('terminal-price') if FETCH_TERMINAL else []
+          transfer_data = fetch_all('transfer-price') if FETCH_TRANSFER else []
+
+          terminal_map = {r['d']: r for r in terminal_data}
+          transfer_map = {r['d']: r['transferPrice'] for r in transfer_data}
+
+          all_dates = set(existing) | set(terminal_map) | set(transfer_map)
+
+          result = []
+          for d in sorted(all_dates):
+              prev = existing.get(d, {})
+              term = terminal_map.get(d, {})
+              result.append({
+                  'd': d,
+                  'unixTs':        str(term.get('unixTs',        prev.get('unixTs', ''))),
+                  'terminalPrice': str(term.get('terminalPrice', prev.get('terminalPrice', ''))),
+                  'transferPrice': str(transfer_map.get(d,       prev.get('transferPrice', '')))
+              })
 
           with open('terminal-price.json', 'w') as f:
-              json.dump(all_records, f, separators=(',', ':'))
+              json.dump(result, f, separators=(',', ':'))
 
-          print(f'Done: {len(all_records)} records saved')
+          print(f'Done: {len(result)} records saved')
           PYEOF
 
       - name: Commit and push
