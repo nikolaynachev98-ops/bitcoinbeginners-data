@@ -15,7 +15,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v5
 
-      - name: Fetch terminal price data from BGeometrics
+      - name: Fetch terminal price and compute transfer price
         env:
           BGEOMETRICS_TOKEN: ${{ secrets.BGEOMETRICS_TOKEN }}
         run: |
@@ -24,19 +24,20 @@ jobs:
           import os
           from urllib.request import Request, urlopen
           from urllib.parse import urlencode
+          from datetime import datetime, timezone
 
           FETCH_TERMINAL = False
-          FETCH_TRANSFER = True
 
           TOKEN = os.environ.get('BGEOMETRICS_TOKEN', '')
+          GENESIS = datetime(2009, 1, 3, tzinfo=timezone.utc)
 
-          def fetch_all(endpoint):
-              base = 'https://api.bitcoin-data.com/v1/' + endpoint
+          # ── BGeometrics: terminal price ──────────────────────────────────
+          def fetch_terminal():
               all_records = []
               page = 1
               size = 5000
               while True:
-                  url = base + '?' + urlencode({'page': page, 'size': size})
+                  url = 'https://api.bitcoin-data.com/v1/terminal-price?' + urlencode({'page': page, 'size': size})
                   req = Request(url)
                   if TOKEN:
                       req.add_header('Authorization', 'Bearer ' + TOKEN)
@@ -45,33 +46,58 @@ jobs:
                   if not data:
                       break
                   all_records.extend(data)
-                  print(f'{endpoint} page {page}: {len(data)} records')
+                  print(f'terminal-price page {page}: {len(data)} records')
                   if len(data) < size:
                       break
                   page += 1
               return all_records
 
-          # Load existing file so skipped endpoints keep their stored values
+          # ── CoinMetrics: CDD + supply (free, no key) ─────────────────────
+          def fetch_coinmetrics():
+              url = (
+                  'https://community-api.coinmetrics.io/v4/timeseries/asset-metrics'
+                  '?assets=btc&metrics=CDD,SplyCur&frequency=1d'
+                  '&start_time=2009-01-01&page_size=10000'
+              )
+              with urlopen(url, timeout=60) as resp:
+                  data = json.loads(resp.read().decode())
+              return data.get('data', [])
+
+          # ── Compute transfer price from CDD ──────────────────────────────
+          def compute_transfer_prices(cm_data):
+              transfer_map = {}
+              cumulative_cdd = 0.0
+              for row in cm_data:
+                  cdd    = float(row.get('CDD')     or 0)
+                  supply = float(row.get('SplyCur') or 0)
+                  date   = datetime.fromisoformat(row['time'].replace('Z', '+00:00'))
+                  days_since_genesis = max((date - GENESIS).days, 1)
+                  cumulative_cdd += cdd
+                  if supply > 0:
+                      transfer = (cumulative_cdd / supply / days_since_genesis) * 21
+                      transfer_map[row['time'][:10]] = round(transfer, 2)
+              return transfer_map
+
+          # ── Load existing file ───────────────────────────────────────────
           try:
               with open('terminal-price.json') as f:
                   existing = {r['d']: r for r in json.load(f)}
           except Exception:
               existing = {}
 
-          terminal_data = fetch_all('terminal-price') if FETCH_TERMINAL else []
-          transfer_data = fetch_all('transfer-price') if FETCH_TRANSFER else []
+          terminal_data = fetch_terminal() if FETCH_TERMINAL else []
+          cm_data       = fetch_coinmetrics()
+          transfer_map  = compute_transfer_prices(cm_data)
 
           terminal_map = {r['d']: r for r in terminal_data}
-          transfer_map = {r['d']: r['transferPrice'] for r in transfer_data}
-
-          all_dates = set(existing) | set(terminal_map) | set(transfer_map)
+          all_dates    = set(existing) | set(terminal_map)
 
           result = []
           for d in sorted(all_dates):
               prev = existing.get(d, {})
               term = terminal_map.get(d, {})
               result.append({
-                  'd': d,
+                  'd':             d,
                   'unixTs':        str(term.get('unixTs',        prev.get('unixTs', ''))),
                   'terminalPrice': str(term.get('terminalPrice', prev.get('terminalPrice', ''))),
                   'transferPrice': str(transfer_map.get(d,       prev.get('transferPrice', '')))
@@ -80,7 +106,21 @@ jobs:
           with open('terminal-price.json', 'w') as f:
               json.dump(result, f, separators=(',', ':'))
 
-          print(f'Done: {len(result)} records saved')
+          print(f'Done: {len(result)} records saved to terminal-price.json')
+
+          # ── Save raw CDD data ────────────────────────────────────────────
+          cdd_result = []
+          for row in cm_data:
+              cdd_result.append({
+                  'd':      row['time'][:10],
+                  'cdd':    str(row.get('CDD')     or ''),
+                  'supply': str(row.get('SplyCur') or '')
+              })
+
+          with open('cdd-data.json', 'w') as f:
+              json.dump(cdd_result, f, separators=(',', ':'))
+
+          print(f'Done: {len(cdd_result)} records saved to cdd-data.json')
           PYEOF
 
       - name: Commit and push
