@@ -1,0 +1,62 @@
+name: Update Bitcoin Terminal Price
+
+on:
+  schedule:
+    - cron: '0 8 * * *'  # Daily at 8 AM UTC
+  workflow_dispatch:
+
+jobs:
+  update-data:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Fetch terminal price data from BGeometrics
+        env:
+          BGEOMETRICS_TOKEN: ${{ secrets.BGEOMETRICS_TOKEN }}
+        run: |
+          python3 << 'PYEOF'
+          import json
+          import os
+          from urllib.request import Request, urlopen
+          from urllib.parse import urlencode
+
+          TOKEN = os.environ.get('BGEOMETRICS_TOKEN', '')
+          BASE_URL = 'https://api.bitcoin-data.com/v1/terminal-price'
+
+          all_records = []
+          page = 1
+          size = 5000
+
+          while True:
+              url = BASE_URL + '?' + urlencode({'page': page, 'size': size})
+              req = Request(url)
+              if TOKEN:
+                  req.add_header('Authorization', 'Bearer ' + TOKEN)
+              with urlopen(req, timeout=30) as resp:
+                  data = json.loads(resp.read().decode())
+              if not data:
+                  break
+              all_records.extend(data)
+              print(f'Page {page}: {len(data)} records (total: {len(all_records)})')
+              if len(data) < size:
+                  break
+              page += 1
+
+          with open('terminal-price.json', 'w') as f:
+              json.dump(all_records, f, separators=(',', ':'))
+
+          print(f'Done: {len(all_records)} records saved')
+          PYEOF
+
+      - name: Commit and push
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add terminal-price.json
+          git diff --staged --quiet || git commit -m "Update terminal price $(date -u +%Y-%m-%d)"
+          git push
