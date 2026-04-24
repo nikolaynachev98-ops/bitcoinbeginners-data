@@ -113,9 +113,16 @@ jobs:
           # ── Compute transfer price from CDD ──────────────────────────────
           # Transfer Price = Σ(CDD × Price) / supply / days_since_genesis × 21
           # CDD (BTC·days) × Price ($/BTC) = $·days → / supply (BTC) / days = $/BTC ✓
+          # The API returns near-zero CDD for most days and large values every ~4 days.
+          # We always accumulate but only record a map entry when the contribution is
+          # significant (>0.05% of running total) so forward-fill handles the gaps.
           def compute_transfer_prices(cdd_data, price_map):
               transfer_map = {}
-              cumulative_cdd_value = 0.0
+              cumulative_cdd_value  = 0.0
+              last_recorded_cumulative = 0.0
+              # Print first few rows to confirm CDD field values
+              for i, row in enumerate(cdd_data[:6]):
+                  print(f'  cdd sample {row["d"]}: cdd={row.get("cdd")} price={price_map.get(row["d"])}')
               for row in cdd_data:
                   d      = row['d']
                   date   = datetime.fromtimestamp(int(row['unixTs']), tz=timezone.utc)
@@ -123,12 +130,18 @@ jobs:
                   price  = price_map.get(d, 0)
                   if price <= 0:
                       continue
+                  cumulative_cdd_value += cdd * price
+                  # Skip days where the CDD contribution is negligibly small
+                  if last_recorded_cumulative > 0:
+                      relative_change = (cumulative_cdd_value - last_recorded_cumulative) / last_recorded_cumulative
+                      if relative_change < 0.0005:
+                          continue
                   days_since_genesis = max((date - GENESIS).days, 1)
                   supply = btc_supply(date)
-                  cumulative_cdd_value += cdd * price
                   if supply > 0:
                       transfer = (cumulative_cdd_value / supply / days_since_genesis) * 21
                       transfer_map[d] = round(transfer, 2)
+                      last_recorded_cumulative = cumulative_cdd_value
               return transfer_map
 
           # ── Load existing file ───────────────────────────────────────────
