@@ -29,15 +29,15 @@ jobs:
           TOKEN = os.environ.get('BGEOMETRICS_TOKEN', '')
           GENESIS = datetime(2009, 1, 3, tzinfo=timezone.utc)
 
-          # ── BGeometrics: terminal price ──────────────────────────────────
-          def fetch_terminal():
+          # ── BGeometrics: generic paginated fetch ─────────────────────────
+          def fetch_all(endpoint):
               all_records = []
-              page = 1
-              size = 5000
+              page     = 1
+              size     = 5000
               today    = datetime.now(timezone.utc).strftime('%Y-%m-%d')
               startday = (datetime.now(timezone.utc) - timedelta(days=4 * 365)).strftime('%Y-%m-%d')
               while True:
-                  url = 'https://api.bitcoin-data.com/v1/terminal-price?' + urlencode({
+                  url = f'https://api.bitcoin-data.com/v1/{endpoint}?' + urlencode({
                       'startday': startday, 'endday': today, 'page': page, 'size': size
                   })
                   req = Request(url)
@@ -45,11 +45,12 @@ jobs:
                       req.add_header('Authorization', 'Bearer ' + TOKEN)
                   with urlopen(req, timeout=30) as resp:
                       data = json.loads(resp.read().decode())
-                  records = data if isinstance(data, list) else data.get('_embedded', {}).get('terminalPriceList', [])
+                  records = data if isinstance(data, list) else data.get('_embedded', {}).get('cddList',
+                            data.get('_embedded', {}).get('terminalPriceList', []))
                   if not records:
                       break
                   all_records.extend(records)
-                  print(f'terminal-price page {page}: {len(records)} records')
+                  print(f'{endpoint} page {page}: {len(records)} records')
                   if len(records) < size:
                       break
                   page += 1
@@ -86,44 +87,19 @@ jobs:
               print(f'prices: {len(price_map)} days')
               return price_map
 
-          # ── BGeometrics: CDD full history ────────────────────────────────
-          def fetch_cdd():
-              all_records = []
-              page = 1
-              size = 5000
-              today     = datetime.now(timezone.utc).strftime('%Y-%m-%d')
-              startday  = (datetime.now(timezone.utc) - timedelta(days=4 * 365)).strftime('%Y-%m-%d')
-              while True:
-                  url = 'https://api.bitcoin-data.com/v1/cdd?' + urlencode({
-                      'startday': startday, 'endday': today, 'page': page, 'size': size
-                  })
-                  req = Request(url)
-                  if TOKEN:
-                      req.add_header('Authorization', 'Bearer ' + TOKEN)
-                  with urlopen(req, timeout=30) as resp:
-                      data = json.loads(resp.read().decode())
-                  records = data if isinstance(data, list) else data.get('_embedded', {}).get('cddList', [])
-                  if not records:
-                      break
-                  all_records.extend(records)
-                  print(f'cdd page {page}: {len(records)} records')
-                  if len(records) < size:
-                      break
-                  page += 1
-              return sorted(all_records, key=lambda r: r['d'])
 
           # ── Hybrid transfer price: API data until corruption, then CDD ────
-          # Walk API transfer prices chronologically. If the next day jumps 2x,
+          # Walk transfer-price API data chronologically. If the next day jumps 2x,
           # treat it as corruption, back-calculate the cumulative CDD value from
           # the last clean seed, and continue forward using CDD × price.
-          def compute_transfer_prices(terminal_data, cdd_data, price_map):
+          def compute_transfer_prices(transfer_data, cdd_data, price_map):
               transfer_map = {}
 
               # Phase 1: use API transfer prices until a 2x jump is detected
               prev_transfer = None
               seed_date     = None
               seed_transfer = None
-              for row in sorted(terminal_data, key=lambda r: r['d']):
+              for row in sorted(transfer_data, key=lambda r: r['d']):
                   d            = row['d']
                   api_transfer = float(row.get('transferPrice') or 0)
                   if api_transfer <= 0:
@@ -178,19 +154,18 @@ jobs:
           except Exception:
               existing = {}
 
-          terminal_data = fetch_terminal()
-          price_map     = fetch_prices()
-          cdd_data      = fetch_cdd()
-          transfer_map  = compute_transfer_prices(terminal_data, cdd_data, price_map)
+          transfer_data  = fetch_all('transfer-price')
+          cdd_data       = sorted(fetch_all('cdd'), key=lambda r: r['d'])
+          price_map      = fetch_prices()
+          transfer_map   = compute_transfer_prices(transfer_data, cdd_data, price_map)
 
-          terminal_map = {r['d']: r for r in terminal_data}
-          all_dates    = set(existing) | set(terminal_map)
+          all_dates    = set(existing)
 
           result = []
           last_transfer = None
           for d in sorted(all_dates):
               prev = existing.get(d, {})
-              term = terminal_map.get(d, {})
+              term = {}
               # Update running transfer price when new data is available
               if d in transfer_map:
                   last_transfer = transfer_map[d]
