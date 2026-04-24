@@ -24,7 +24,7 @@ jobs:
           import os
           from urllib.request import Request, urlopen
           from urllib.parse import urlencode
-          from datetime import datetime, timezone
+          from datetime import datetime, timezone, timedelta
 
           FETCH_TERMINAL = False
 
@@ -89,10 +89,11 @@ jobs:
               all_records = []
               page = 1
               size = 5000
+              today     = datetime.now(timezone.utc).strftime('%Y-%m-%d')
+              startday  = (datetime.now(timezone.utc) - timedelta(days=4 * 365)).strftime('%Y-%m-%d')
               while True:
-                  # Include day/startday/endday params — required by the Spring endpoint
                   url = 'https://api.bitcoin-data.com/v1/cdd?' + urlencode({
-                      'day': '', 'startday': '', 'endday': '', 'page': page, 'size': size
+                      'startday': startday, 'endday': today, 'page': page, 'size': size
                   })
                   req = Request(url)
                   if TOKEN:
