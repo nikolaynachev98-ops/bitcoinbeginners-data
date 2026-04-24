@@ -26,8 +26,6 @@ jobs:
           from urllib.parse import urlencode
           from datetime import datetime, timezone, timedelta
 
-          FETCH_TERMINAL = False
-
           TOKEN = os.environ.get('BGEOMETRICS_TOKEN', '')
           GENESIS = datetime(2009, 1, 3, tzinfo=timezone.utc)
 
@@ -36,8 +34,12 @@ jobs:
               all_records = []
               page = 1
               size = 5000
+              today    = datetime.now(timezone.utc).strftime('%Y-%m-%d')
+              startday = (datetime.now(timezone.utc) - timedelta(days=4 * 365)).strftime('%Y-%m-%d')
               while True:
-                  url = 'https://api.bitcoin-data.com/v1/terminal-price?' + urlencode({'page': page, 'size': size})
+                  url = 'https://api.bitcoin-data.com/v1/terminal-price?' + urlencode({
+                      'startday': startday, 'endday': today, 'page': page, 'size': size
+                  })
                   req = Request(url)
                   if TOKEN:
                       req.add_header('Authorization', 'Bearer ' + TOKEN)
@@ -110,38 +112,63 @@ jobs:
                   page += 1
               return sorted(all_records, key=lambda r: r['d'])
 
-          # ── Compute transfer price from CDD ──────────────────────────────
-          # Transfer Price = Σ(CDD × Price) / supply / days_since_genesis × 21
-          # CDD (BTC·days) × Price ($/BTC) = $·days → / supply (BTC) / days = $/BTC ✓
-          # The API returns near-zero CDD for most days and large values every ~4 days.
-          # We always accumulate but only record a map entry when the contribution is
-          # significant (>0.05% of running total) so forward-fill handles the gaps.
-          def compute_transfer_prices(cdd_data, price_map):
+          # ── Hybrid transfer price: API data until corruption, then CDD ────
+          # Walk API transfer prices chronologically. If the next day jumps 2x,
+          # treat it as corruption, back-calculate the cumulative CDD value from
+          # the last clean seed, and continue forward using CDD × price.
+          def compute_transfer_prices(terminal_data, cdd_data, price_map):
               transfer_map = {}
-              cumulative_cdd_value  = 0.0
-              last_recorded_cumulative = 0.0
-              # Print first few rows to confirm CDD field values
-              for i, row in enumerate(cdd_data[:6]):
-                  print(f'  cdd sample {row["d"]}: cdd={row.get("cdd")} price={price_map.get(row["d"])}')
-              for row in cdd_data:
-                  d      = row['d']
-                  date   = datetime.fromtimestamp(int(row['unixTs']), tz=timezone.utc)
-                  cdd    = float(row.get('cdd') or 0)
-                  price  = price_map.get(d, 0)
+
+              # Phase 1: use API transfer prices until a 2x jump is detected
+              prev_transfer = None
+              seed_date     = None
+              seed_transfer = None
+              for row in sorted(terminal_data, key=lambda r: r['d']):
+                  d            = row['d']
+                  api_transfer = float(row.get('transferPrice') or 0)
+                  if api_transfer <= 0:
+                      continue
+                  if prev_transfer and api_transfer > prev_transfer * 2:
+                      print(f'Corruption at {d}: {prev_transfer} → {api_transfer}, switching to CDD')
+                      break
+                  transfer_map[d] = round(api_transfer, 2)
+                  seed_date     = d
+                  seed_transfer = api_transfer
+                  prev_transfer = api_transfer
+
+              print(f'API transfer prices: {len(transfer_map)} records, seed={seed_date} @ {seed_transfer}')
+
+              if not seed_date:
+                  print('No valid API seed found')
+                  return transfer_map
+
+              # Phase 2: back-calculate cumulative from seed, continue with CDD
+              seed_dt     = datetime.strptime(seed_date, '%Y-%m-%d').replace(tzinfo=timezone.utc)
+              seed_days   = max((seed_dt - GENESIS).days, 1)
+              seed_supply = btc_supply(seed_dt)
+              cumulative  = seed_transfer * seed_supply * seed_days / 21
+              print(f'Seeded cumulative: {cumulative:.4e}')
+
+              last_cumulative = cumulative
+              for row in sorted(cdd_data, key=lambda r: r['d']):
+                  d     = row['d']
+                  if d <= seed_date:
+                      continue
+                  cdd   = float(row.get('cdd') or 0)
+                  price = price_map.get(d, 0)
                   if price <= 0:
                       continue
-                  cumulative_cdd_value += cdd * price
-                  # Skip days where the CDD contribution is negligibly small
-                  if last_recorded_cumulative > 0:
-                      relative_change = (cumulative_cdd_value - last_recorded_cumulative) / last_recorded_cumulative
-                      if relative_change < 0.0005:
-                          continue
-                  days_since_genesis = max((date - GENESIS).days, 1)
+                  cumulative += cdd * price
+                  if last_cumulative > 0 and (cumulative - last_cumulative) / last_cumulative < 0.0005:
+                      continue
+                  date   = datetime.strptime(d, '%Y-%m-%d').replace(tzinfo=timezone.utc)
                   supply = btc_supply(date)
+                  days   = max((date - GENESIS).days, 1)
                   if supply > 0:
-                      transfer = (cumulative_cdd_value / supply / days_since_genesis) * 21
-                      transfer_map[d] = round(transfer, 2)
-                      last_recorded_cumulative = cumulative_cdd_value
+                      transfer_map[d] = round((cumulative / supply / days) * 21, 2)
+                      last_cumulative  = cumulative
+
+              print(f'Total transfer prices: {len(transfer_map)}')
               return transfer_map
 
           # ── Load existing file ───────────────────────────────────────────
@@ -151,10 +178,10 @@ jobs:
           except Exception:
               existing = {}
 
-          terminal_data = fetch_terminal() if FETCH_TERMINAL else []
+          terminal_data = fetch_terminal()
           price_map     = fetch_prices()
           cdd_data      = fetch_cdd()
-          transfer_map  = compute_transfer_prices(cdd_data, price_map)
+          transfer_map  = compute_transfer_prices(terminal_data, cdd_data, price_map)
 
           terminal_map = {r['d']: r for r in terminal_data}
           all_dates    = set(existing) | set(terminal_map)
