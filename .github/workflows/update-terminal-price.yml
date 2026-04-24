@@ -72,6 +72,18 @@ jobs:
                   supply += days * 144 * reward
               return supply
 
+          # ── Blockchain.info: daily price history ────────────────────────
+          def fetch_prices():
+              url = 'https://api.blockchain.info/charts/market-price?format=json&timespan=all&cors=true'
+              with urlopen(url, timeout=60) as resp:
+                  data = json.loads(resp.read().decode())
+              price_map = {}
+              for v in data.get('values', []):
+                  d = datetime.fromtimestamp(v['x'], tz=timezone.utc).strftime('%Y-%m-%d')
+                  price_map[d] = float(v['y'])
+              print(f'prices: {len(price_map)} days')
+              return price_map
+
           # ── BGeometrics: CDD full history ────────────────────────────────
           def fetch_cdd():
               all_records = []
@@ -98,18 +110,24 @@ jobs:
               return sorted(all_records, key=lambda r: r['d'])
 
           # ── Compute transfer price from CDD ──────────────────────────────
-          def compute_transfer_prices(cdd_data):
+          # Transfer Price = Σ(CDD × Price) / supply / days_since_genesis × 21
+          # CDD (BTC·days) × Price ($/BTC) = $·days → / supply (BTC) / days = $/BTC ✓
+          def compute_transfer_prices(cdd_data, price_map):
               transfer_map = {}
-              cumulative_cdd = 0.0
+              cumulative_cdd_value = 0.0
               for row in cdd_data:
+                  d      = row['d']
                   date   = datetime.fromtimestamp(int(row['unixTs']), tz=timezone.utc)
                   cdd    = float(row.get('cdd') or 0)
+                  price  = price_map.get(d, 0)
+                  if price <= 0:
+                      continue
                   days_since_genesis = max((date - GENESIS).days, 1)
                   supply = btc_supply(date)
-                  cumulative_cdd += cdd
+                  cumulative_cdd_value += cdd * price
                   if supply > 0:
-                      transfer = (cumulative_cdd / supply / days_since_genesis) * 21
-                      transfer_map[row['d']] = round(transfer, 2)
+                      transfer = (cumulative_cdd_value / supply / days_since_genesis) * 21
+                      transfer_map[d] = round(transfer, 2)
               return transfer_map
 
           # ── Load existing file ───────────────────────────────────────────
@@ -120,8 +138,9 @@ jobs:
               existing = {}
 
           terminal_data = fetch_terminal() if FETCH_TERMINAL else []
+          price_map     = fetch_prices()
           cdd_data      = fetch_cdd()
-          transfer_map  = compute_transfer_prices(cdd_data)
+          transfer_map  = compute_transfer_prices(cdd_data, price_map)
 
           terminal_map = {r['d']: r for r in terminal_data}
           all_dates    = set(existing) | set(terminal_map)
