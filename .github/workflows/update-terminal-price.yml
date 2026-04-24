@@ -71,26 +71,40 @@ jobs:
                   supply += days * 144 * reward
               return supply
 
-          # ── Blockchain.info: CDD full history (free, no key) ────────────
+          # ── BGeometrics: CDD full history ────────────────────────────────
           def fetch_cdd():
-              url = 'https://api.blockchain.info/charts/coin-days-destroyed?format=json&timespan=all&cors=true'
-              with urlopen(url, timeout=60) as resp:
-                  data = json.loads(resp.read().decode())
-              return data.get('values', [])
+              all_records = []
+              page = 1
+              size = 5000
+              while True:
+                  url = 'https://api.bitcoin-data.com/v1/cdd?' + urlencode({'page': page, 'size': size})
+                  req = Request(url)
+                  if TOKEN:
+                      req.add_header('Authorization', 'Bearer ' + TOKEN)
+                  with urlopen(req, timeout=30) as resp:
+                      data = json.loads(resp.read().decode())
+                  if not data:
+                      break
+                  all_records.extend(data)
+                  print(f'cdd page {page}: {len(data)} records')
+                  if len(data) < size:
+                      break
+                  page += 1
+              return sorted(all_records, key=lambda r: r['d'])
 
           # ── Compute transfer price from CDD ──────────────────────────────
           def compute_transfer_prices(cdd_data):
               transfer_map = {}
               cumulative_cdd = 0.0
               for row in cdd_data:
-                  date   = datetime.fromtimestamp(row['x'], tz=timezone.utc)
-                  cdd    = float(row.get('y') or 0)
+                  date   = datetime.fromtimestamp(int(row['unixTs']), tz=timezone.utc)
+                  cdd    = float(row.get('cdd') or 0)
                   days_since_genesis = max((date - GENESIS).days, 1)
                   supply = btc_supply(date)
                   cumulative_cdd += cdd
                   if supply > 0:
                       transfer = (cumulative_cdd / supply / days_since_genesis) * 21
-                      transfer_map[date.strftime('%Y-%m-%d')] = round(transfer, 2)
+                      transfer_map[row['d']] = round(transfer, 2)
               return transfer_map
 
           # ── Load existing file ───────────────────────────────────────────
@@ -127,8 +141,8 @@ jobs:
           cdd_result = []
           for row in cdd_data:
               cdd_result.append({
-                  'd':   datetime.fromtimestamp(row['x'], tz=timezone.utc).strftime('%Y-%m-%d'),
-                  'cdd': str(row.get('y') or '')
+                  'd':   row['d'],
+                  'cdd': str(row.get('cdd') or '')
               })
 
           with open('cdd-data.json', 'w') as f:

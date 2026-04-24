@@ -1,0 +1,139 @@
+name: Update Bitcoin Balanced Price
+
+on:
+  schedule:
+    - cron: '10 0 * * *'  # Daily at 00:10 UTC
+  workflow_dispatch:
+
+jobs:
+  update-data:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Fetch CDD and compute balanced price
+        env:
+          RESEARCHBITCOIN_TOKEN: ${{ secrets.RESEARCHBITCOIN_TOKEN }}
+        run: |
+          python3 << 'PYEOF'
+          import json
+          import os
+          from urllib.request import Request, urlopen
+          from datetime import datetime, timezone
+
+          RB_TOKEN = os.environ.get('RESEARCHBITCOIN_TOKEN', '')
+          if not RB_TOKEN:
+              raise SystemExit('RESEARCHBITCOIN_TOKEN secret is not set')
+
+          # ── researchbitcoin.net: CDD full history ────────────────────────
+          def fetch_cdd():
+              url = ('https://api.researchbitcoin.net/v2/utxo_dormancy/coindays_destroyed'
+                     '?resolution=d1&from_time=2010-01-01&output_format=json')
+              req = Request(url)
+              req.add_header('X-API-Token', RB_TOKEN)
+              with urlopen(req, timeout=60) as resp:
+                  data = json.loads(resp.read().decode())
+              rows = data.get('data', [])
+              print(f'CDD: {len(rows)} records')
+              if rows:
+                  print(f'  sample row: {rows[0]}')
+              result = {}
+              for row in rows:
+                  # Handle t/time/date/timestamp field names
+                  t = row.get('t') or row.get('time') or row.get('timestamp') or row.get('date') or ''
+                  # Handle v/value/coindays_destroyed field names
+                  v = row.get('v')
+                  if v is None:
+                      v = row.get('value') or row.get('coindays_destroyed') or 0
+                  if not t:
+                      continue
+                  if isinstance(t, (int, float)):
+                      ms = t if t > 1e10 else t * 1000
+                      d = datetime.fromtimestamp(ms / 1000, tz=timezone.utc).strftime('%Y-%m-%d')
+                  else:
+                      d = str(t)[:10]
+                  result[d] = float(v or 0)
+              return result
+
+          # ── CoinMetrics: price + MVRV ────────────────────────────────────
+          def fetch_coinmetrics():
+              url = ('https://community-api.coinmetrics.io/v4/timeseries/asset-metrics'
+                     '?assets=btc&metrics=PriceUSD,CapMVRVCur&frequency=1d'
+                     '&start_time=2010-01-01&page_size=10000')
+              with urlopen(url, timeout=60) as resp:
+                  data = json.loads(resp.read().decode())
+              rows = data.get('data', [])
+              print(f'CoinMetrics: {len(rows)} records')
+              result = {}
+              for row in rows:
+                  d = (row.get('time') or '')[:10]
+                  price = float(row.get('PriceUSD') or 0)
+                  mvrv  = float(row.get('CapMVRVCur') or 0)
+                  if d and price > 0 and mvrv > 0:
+                      result[d] = {'price': price, 'realized': round(price / mvrv, 2)}
+              return result
+
+          # ── Fetch ────────────────────────────────────────────────────────
+          cdd_map = fetch_cdd()
+          cm_map  = fetch_coinmetrics()
+
+          # ── Compute Transfer Price (CDD-weighted average price) ──────────
+          # Transfer Price = Σ(CDD × Price) / Σ(CDD)
+          # Gives the average USD price weighted by coin-day destruction events.
+          # Old coins moving at low prices anchor this well below Realized Price.
+          # Balanced Price = Realized Price - Transfer Price acts as the cycle floor.
+
+          dates = sorted(set(cdd_map) & set(cm_map))
+
+          cumulative_cdd_value = 0.0  # Σ(CDD × Price) in $·coin-days
+          cumulative_cdd       = 0.0  # Σ(CDD)         in coin-days
+
+          result = []
+          for d in dates:
+              cdd = cdd_map[d]
+              cm  = cm_map[d]
+
+              cumulative_cdd_value += cdd * cm['price']
+              cumulative_cdd       += cdd
+
+              if cumulative_cdd <= 0:
+                  continue
+
+              transfer_price = cumulative_cdd_value / cumulative_cdd
+              balanced_price = cm['realized'] - transfer_price
+
+              unix_ts = int(datetime.strptime(d, '%Y-%m-%d')
+                            .replace(tzinfo=timezone.utc).timestamp())
+
+              result.append({
+                  'd':             d,
+                  'unixTs':        str(unix_ts),
+                  'price':         round(cm['price'],     2),
+                  'realizedPrice': round(cm['realized'],  2),
+                  'transferPrice': round(transfer_price,  2),
+                  'balancedPrice': round(balanced_price,  2),
+              })
+
+          print(f'Computed {len(result)} records')
+          if result:
+              for r in result[-3:]:
+                  print(f"  {r['d']} price={r['price']} realized={r['realizedPrice']} "
+                        f"transfer={r['transferPrice']} balanced={r['balancedPrice']}")
+
+          with open('balanced-price.json', 'w') as f:
+              json.dump(result, f, separators=(',', ':'))
+
+          print('Saved balanced-price.json')
+          PYEOF
+
+      - name: Commit and push
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add balanced-price.json
+          git diff --staged --quiet || git commit -m "Update balanced price $(date -u +%Y-%m-%d)"
+          git push
