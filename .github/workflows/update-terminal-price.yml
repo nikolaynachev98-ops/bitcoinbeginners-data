@@ -43,11 +43,12 @@ jobs:
                       req.add_header('Authorization', 'Bearer ' + TOKEN)
                   with urlopen(req, timeout=30) as resp:
                       data = json.loads(resp.read().decode())
-                  if not data:
+                  records = data if isinstance(data, list) else data.get('_embedded', {}).get('terminalPriceList', [])
+                  if not records:
                       break
-                  all_records.extend(data)
-                  print(f'terminal-price page {page}: {len(data)} records')
-                  if len(data) < size:
+                  all_records.extend(records)
+                  print(f'terminal-price page {page}: {len(records)} records')
+                  if len(records) < size:
                       break
                   page += 1
               return all_records
@@ -77,17 +78,21 @@ jobs:
               page = 1
               size = 5000
               while True:
-                  url = 'https://api.bitcoin-data.com/v1/cdd?' + urlencode({'page': page, 'size': size})
+                  # Include day/startday/endday params — required by the Spring endpoint
+                  url = 'https://api.bitcoin-data.com/v1/cdd?' + urlencode({
+                      'day': '', 'startday': '', 'endday': '', 'page': page, 'size': size
+                  })
                   req = Request(url)
                   if TOKEN:
                       req.add_header('Authorization', 'Bearer ' + TOKEN)
                   with urlopen(req, timeout=30) as resp:
                       data = json.loads(resp.read().decode())
-                  if not data:
+                  records = data if isinstance(data, list) else data.get('_embedded', {}).get('cddList', [])
+                  if not records:
                       break
-                  all_records.extend(data)
-                  print(f'cdd page {page}: {len(data)} records')
-                  if len(data) < size:
+                  all_records.extend(records)
+                  print(f'cdd page {page}: {len(records)} records')
+                  if len(records) < size:
                       break
                   page += 1
               return sorted(all_records, key=lambda r: r['d'])
