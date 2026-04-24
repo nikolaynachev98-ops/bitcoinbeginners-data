@@ -147,14 +147,21 @@ jobs:
           all_dates    = set(existing) | set(terminal_map)
 
           result = []
+          last_transfer = None
           for d in sorted(all_dates):
               prev = existing.get(d, {})
               term = terminal_map.get(d, {})
+              # Update running transfer price when new data is available
+              if d in transfer_map:
+                  last_transfer = transfer_map[d]
+              # Forward-fill for days without CDD data; only fall back to existing
+              # value if we have no new data at all yet (before CDD history starts)
+              transfer_price = str(last_transfer) if last_transfer is not None else prev.get('transferPrice', '')
               result.append({
                   'd':             d,
                   'unixTs':        str(term.get('unixTs',        prev.get('unixTs', ''))),
                   'terminalPrice': str(term.get('terminalPrice', prev.get('terminalPrice', ''))),
-                  'transferPrice': str(transfer_map.get(d,       prev.get('transferPrice', '')))
+                  'transferPrice': transfer_price
               })
 
           with open('terminal-price.json', 'w') as f:
