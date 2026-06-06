@@ -17,46 +17,48 @@ jobs:
 
       - name: Fetch CDD and compute balanced price
         env:
-          RESEARCHBITCOIN_TOKEN: ${{ secrets.RESEARCHBITCOIN_TOKEN }}
+          BGEOMETRICS_TOKEN: ${{ secrets.BGEOMETRICS_TOKEN }}
         run: |
           python3 << 'PYEOF'
           import json
           import os
           from urllib.request import Request, urlopen
-          from datetime import datetime, timezone
+          from urllib.parse import urlencode
+          from datetime import datetime, timezone, timedelta
 
-          RB_TOKEN = os.environ.get('RESEARCHBITCOIN_TOKEN', '')
-          if not RB_TOKEN:
-              raise SystemExit('RESEARCHBITCOIN_TOKEN secret is not set')
+          TOKEN = os.environ.get('BGEOMETRICS_TOKEN', '')
 
-          # ── researchbitcoin.net: CDD full history ────────────────────────
+          # ── BGeometrics: paginated CDD fetch ─────────────────────────────
           def fetch_cdd():
-              url = ('https://api.researchbitcoin.net/v2/utxo_dormancy/coindays_destroyed'
-                     '?resolution=d1&from_time=2010-01-01&output_format=json')
-              req = Request(url)
-              req.add_header('X-API-Token', RB_TOKEN)
-              with urlopen(req, timeout=60) as resp:
-                  data = json.loads(resp.read().decode())
-              rows = data.get('data', [])
-              print(f'CDD: {len(rows)} records')
-              if rows:
-                  print(f'  sample row: {rows[0]}')
+              all_records = []
+              page      = 1
+              size      = 5000
+              today     = datetime.now(timezone.utc).strftime('%Y-%m-%d')
+              startday  = '2010-01-01'
+              while True:
+                  url = 'https://api.bitcoin-data.com/v1/cdd?' + urlencode({
+                      'startday': startday, 'endday': today, 'page': page, 'size': size
+                  })
+                  req = Request(url)
+                  if TOKEN:
+                      req.add_header('Authorization', 'Bearer ' + TOKEN)
+                  with urlopen(req, timeout=30) as resp:
+                      data = json.loads(resp.read().decode())
+                  records = data if isinstance(data, list) else data.get('_embedded', {}).get('cddList', [])
+                  if not records:
+                      break
+                  all_records.extend(records)
+                  print(f'CDD page {page}: {len(records)} records')
+                  if len(records) < size:
+                      break
+                  page += 1
               result = {}
-              for row in rows:
-                  # Handle t/time/date/timestamp field names
-                  t = row.get('t') or row.get('time') or row.get('timestamp') or row.get('date') or ''
-                  # Handle v/value/coindays_destroyed field names
-                  v = row.get('v')
-                  if v is None:
-                      v = row.get('value') or row.get('coindays_destroyed') or 0
-                  if not t:
-                      continue
-                  if isinstance(t, (int, float)):
-                      ms = t if t > 1e10 else t * 1000
-                      d = datetime.fromtimestamp(ms / 1000, tz=timezone.utc).strftime('%Y-%m-%d')
-                  else:
-                      d = str(t)[:10]
-                  result[d] = float(v or 0)
+              for row in all_records:
+                  d   = row.get('d', '')
+                  cdd = float(row.get('cdd') or 0)
+                  if d:
+                      result[d] = cdd
+              print(f'CDD total: {len(result)} records')
               return result
 
           # ── CoinMetrics: price + MVRV ────────────────────────────────────
