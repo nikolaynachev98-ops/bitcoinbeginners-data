@@ -1,8 +1,6 @@
 name: Update Bitcoin Cycle Prices
 
 on:
-  schedule:
-    - cron: '15 0 * * *'  # Daily at 00:15 UTC
   workflow_dispatch:
 
 jobs:
