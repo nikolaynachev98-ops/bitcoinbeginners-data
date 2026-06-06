@@ -16,12 +16,16 @@ jobs:
         uses: actions/checkout@v5
 
       - name: Compute cycle prices
+        env:
+          BLOCKCHAIR_KEY: ${{ secrets.BLOCKCHAIR_KEY }}
         run: |
           python3 << 'PYEOF'
-          import json, time
-          from urllib.request import urlopen, Request
+          import json, time, os
+          from urllib.request import urlopen
           from urllib.error import HTTPError
           from datetime import datetime, timezone, timedelta
+
+          BLOCKCHAIR_KEY = os.environ.get('BLOCKCHAIR_KEY', '').strip()
 
           # ── CoinMetrics community: PriceUSD + SplyCur + CapMVRVCur ─────────
           def fetch_cm():
@@ -47,23 +51,25 @@ jobs:
               return result
 
           # ── Blockchair: daily CDD via block aggregation ───────────────────
-          # Free tier allows ~1 000 calls/day without a key.
-          # Each request covers up to 400 days; we paginate through the full history.
+          # Requires BLOCKCHAIR_KEY secret. Free keys available at blockchair.com/api/plans
           def fetch_blockchair_cdd(start='2010-01-01'):
+              if not BLOCKCHAIR_KEY:
+                  print('No BLOCKCHAIR_KEY secret — skipping Blockchair fetch')
+                  return None
               cdd_by_date = {}
-              today = datetime.now(timezone.utc).strftime('%Y-%m-%d')
+              today   = datetime.now(timezone.utc).strftime('%Y-%m-%d')
               current = datetime.strptime(start, '%Y-%m-%d')
               end_dt  = datetime.strptime(today,  '%Y-%m-%d')
               step    = timedelta(days=399)
               page    = 0
-
               while current <= end_dt:
                   chunk_end = min(current + step, end_dt)
                   url = ('https://api.blockchair.com/bitcoin/blocks'
                          '?a=date,sum(cdd_total)'
                          '&q=time(' + current.strftime('%Y-%m-%d') + '..'
                                     + chunk_end.strftime('%Y-%m-%d') + ')'
-                         '&s=date(asc)&limit=400')
+                         '&s=date(asc)&limit=400'
+                         '&key=' + BLOCKCHAIR_KEY)
                   try:
                       with urlopen(url, timeout=30) as r:
                           body = json.loads(r.read().decode())
@@ -76,40 +82,32 @@ jobs:
                       page += 1
                       print(f'Blockchair page {page}: {len(rows)} rows '
                             f'({current.strftime("%Y-%m-%d")} .. {chunk_end.strftime("%Y-%m-%d")})')
-                      time.sleep(0.5)   # polite delay
+                      time.sleep(0.3)
                   except HTTPError as e:
-                      print(f'Blockchair HTTP {e.code} for range '
-                            f'{current.strftime("%Y-%m-%d")}..{chunk_end.strftime("%Y-%m-%d")}: {e}')
-                      if e.code in (429, 430):
-                          print('Rate-limited — aborting Blockchair fetch')
-                          return None
+                      print(f'Blockchair HTTP {e.code}: {e}')
+                      return None
                   except Exception as e:
                       print(f'Blockchair error: {e}')
                       return None
                   current = chunk_end + timedelta(days=1)
-
               print(f'Blockchair CDD total: {len(cdd_by_date)} dates')
               return cdd_by_date
 
-          # ── Fetch CoinMetrics ────────────────────────────────────────────
-          cm_map = fetch_cm()
-
-          # ── Try Blockchair CDD first ─────────────────────────────────────
-          print('Trying Blockchair for CDD data...')
+          # ── Fetch ────────────────────────────────────────────────────────
+          cm_map  = fetch_cm()
           cdd_map = fetch_blockchair_cdd()
           use_cdd = cdd_map is not None and len(cdd_map) > 100
 
           if use_cdd:
               print(f'Using Blockchair CDD ({len(cdd_map)} dates)')
           else:
-              print('Blockchair unavailable — falling back to issuance-weighted approximation')
+              print('Using issuance-weighted approximation (transfer price will be ~3x too low)')
 
-          # ── Compute transfer price ───────────────────────────────────────
-          dates = sorted(cm_map.keys())
+          # ── Compute ──────────────────────────────────────────────────────
+          dates  = sorted(cm_map.keys())
           result = []
 
           if use_cdd:
-              # CDD-weighted average price: Σ(CDD × price) / Σ(CDD)
               cum_cdd_value = 0.0
               cum_cdd       = 0.0
               for d in dates:
@@ -133,10 +131,8 @@ jobs:
                       'transferPrice': round(transfer_price,  2),
                       'terminalPrice': round(terminal_price,  2),
                       'balancedPrice': round(balanced_price,  2),
-                      'source':        'cdd',
                   })
           else:
-              # Fallback: issuance-weighted (underestimates ~3x vs real CDD)
               cum_issuance_value = 0.0
               prev_sply          = None
               for d in dates:
@@ -161,10 +157,9 @@ jobs:
                       'transferPrice': round(transfer_price,  2),
                       'terminalPrice': round(terminal_price,  2),
                       'balancedPrice': round(balanced_price,  2),
-                      'source':        'issuance-approx',
                   })
 
-          print(f'Computed {len(result)} records  (source: {"cdd" if use_cdd else "issuance-approx"})')
+          print(f'Computed {len(result)} records')
           if result:
               for r in result[-5:]:
                   print(f"  {r['d']}  price={r['price']}  realized={r['realizedPrice']}  "
@@ -173,7 +168,6 @@ jobs:
 
           with open('cycle-prices.json', 'w') as f:
               json.dump(result, f, separators=(',', ':'))
-
           print('Saved cycle-prices.json')
           PYEOF
 

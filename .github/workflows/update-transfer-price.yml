@@ -1,0 +1,142 @@
+name: Update Bitcoin Transfer Price
+
+on:
+  schedule:
+    - cron: '20 0 * * *'  # Daily at 00:20 UTC
+  workflow_dispatch:
+
+jobs:
+  update-data:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Compute transfer price
+        env:
+          BGEOMETRICS_TOKEN: ${{ secrets.BGEOMETRICS_TOKEN }}
+        run: |
+          python3 << 'PYEOF'
+          import json, os
+          from urllib.request import Request, urlopen
+          from urllib.parse import urlencode
+          from datetime import datetime, timezone, date
+
+          TOKEN   = os.environ.get('BGEOMETRICS_TOKEN', '')
+          GENESIS = date(2009, 1, 3)
+
+          # ── BGeometrics: paginated daily CDD ─────────────────────────────
+          def fetch_cdd():
+              all_records = []
+              page     = 1
+              size     = 5000
+              today    = datetime.now(timezone.utc).strftime('%Y-%m-%d')
+              startday = '2010-01-01'
+              while True:
+                  url = 'https://api.bitcoin-data.com/v1/cdd?' + urlencode({
+                      'startday': startday, 'endday': today, 'page': page, 'size': size
+                  })
+                  req = Request(url)
+                  if TOKEN:
+                      req.add_header('Authorization', 'Bearer ' + TOKEN)
+                  with urlopen(req, timeout=30) as r:
+                      data = json.loads(r.read().decode())
+                  records = data if isinstance(data, list) else data.get('_embedded', {}).get('cddList', [])
+                  if not records:
+                      break
+                  all_records.extend(records)
+                  print(f'CDD page {page}: {len(records)} records')
+                  if len(records) < size:
+                      break
+                  page += 1
+              result = {}
+              for row in all_records:
+                  d   = row.get('d', '')
+                  cdd = float(row.get('cdd') or 0)
+                  if d and cdd >= 0:
+                      result[d] = cdd
+              print(f'CDD total: {len(result)} dates')
+              return result
+
+          # ── CoinMetrics community: daily price + supply + MVRV ───────────
+          # PriceUSD is the daily BTC/USD price — same source used across the app.
+          def fetch_cm():
+              base = ('https://community-api.coinmetrics.io/v4/timeseries/asset-metrics'
+                      '?assets=btc&metrics=PriceUSD,SplyCur,CapMVRVCur'
+                      '&frequency=1d&start_time=2010-01-01&page_size=10000')
+              rows = []
+              url  = base
+              while url:
+                  with urlopen(url, timeout=60) as r:
+                      body = json.loads(r.read().decode())
+                  rows.extend(body.get('data', []))
+                  url = body.get('next_page_url')
+              result = {}
+              for row in rows:
+                  d     = row.get('time', '')[:10]
+                  price = float(row.get('PriceUSD')   or 0)
+                  sply  = float(row.get('SplyCur')    or 0)
+                  mvrv  = float(row.get('CapMVRVCur') or 0)
+                  if d and price > 0 and sply > 0 and mvrv > 0:
+                      result[d] = {'price': price, 'sply': sply, 'mvrv': mvrv}
+              print(f'CoinMetrics: {len(result)} dates')
+              return result
+
+          # ── Fetch ────────────────────────────────────────────────────────
+          cdd_map = fetch_cdd()
+          cm_map  = fetch_cm()
+
+          # ── Compute transfer price ───────────────────────────────────────
+          # Transfer Price[t] = Σ(CDD_d × Price_d) / SplyCur[t] / Age[t]
+          # Age[t] = days since Bitcoin genesis (2009-01-03)
+
+          dates = sorted(set(cdd_map) & set(cm_map))
+
+          cum_cdd_value = 0.0   # Σ(daily CDD × BTC price)
+          result        = []
+
+          for d in dates:
+              cdd = cdd_map[d]
+              cm  = cm_map[d]
+
+              cum_cdd_value += cdd * cm['price']
+
+              d_date   = date.fromisoformat(d)
+              age_days = (d_date - GENESIS).days
+              if age_days <= 0 or cm['sply'] <= 0:
+                  continue
+
+              transfer_price = cum_cdd_value / cm['sply'] / age_days
+              realized_price = cm['price'] / cm['mvrv']
+
+              unix_ts = int(datetime(d_date.year, d_date.month, d_date.day,
+                                     tzinfo=timezone.utc).timestamp())
+              result.append({
+                  'd':             d,
+                  'unixTs':        str(unix_ts),
+                  'price':         round(cm['price'],     2),
+                  'realizedPrice': round(realized_price,  2),
+                  'transferPrice': round(transfer_price,  2),
+              })
+
+          print(f'Computed {len(result)} records')
+          if result:
+              for r in result[-5:]:
+                  print(f"  {r['d']}  price={r['price']}  "
+                        f"realized={r['realizedPrice']}  transfer={r['transferPrice']}")
+
+          with open('transfer-price.json', 'w') as f:
+              json.dump(result, f, separators=(',', ':'))
+          print('Saved transfer-price.json')
+          PYEOF
+
+      - name: Commit and push
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add transfer-price.json
+          git diff --staged --quiet || git commit -m "Update transfer price $(date -u +%Y-%m-%d)"
+          git push
