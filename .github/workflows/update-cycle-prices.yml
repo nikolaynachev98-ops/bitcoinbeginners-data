@@ -15,16 +15,15 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v5
 
-      - name: Compute cycle prices (100% CoinMetrics community, no external deps)
+      - name: Compute cycle prices
         run: |
           python3 << 'PYEOF'
-          import json
-          from urllib.request import urlopen
-          from datetime import datetime, timezone
+          import json, time
+          from urllib.request import urlopen, Request
+          from urllib.error import HTTPError
+          from datetime import datetime, timezone, timedelta
 
           # ── CoinMetrics community: PriceUSD + SplyCur + CapMVRVCur ─────────
-          # All three metrics are in the free community tier.
-          # Realized Price = PriceUSD / CapMVRVCur (no CapRealUSD needed).
           def fetch_cm():
               base = ('https://community-api.coinmetrics.io/v4/timeseries/asset-metrics'
                       '?assets=btc&metrics=PriceUSD,SplyCur,CapMVRVCur'
@@ -37,57 +36,135 @@ jobs:
                   rows.extend(body.get('data', []))
                   url = body.get('next_page_url')
               print(f'CoinMetrics: {len(rows)} rows')
-              return rows
+              result = {}
+              for row in rows:
+                  d     = row.get('time', '')[:10]
+                  price = float(row.get('PriceUSD')   or 0)
+                  sply  = float(row.get('SplyCur')    or 0)
+                  mvrv  = float(row.get('CapMVRVCur') or 0)
+                  if d and price > 0 and sply > 0 and mvrv > 0:
+                      result[d] = {'price': price, 'sply': sply, 'mvrv': mvrv}
+              return result
 
-          rows = fetch_cm()
+          # ── Blockchair: daily CDD via block aggregation ───────────────────
+          # Free tier allows ~1 000 calls/day without a key.
+          # Each request covers up to 400 days; we paginate through the full history.
+          def fetch_blockchair_cdd(start='2010-01-01'):
+              cdd_by_date = {}
+              today = datetime.now(timezone.utc).strftime('%Y-%m-%d')
+              current = datetime.strptime(start, '%Y-%m-%d')
+              end_dt  = datetime.strptime(today,  '%Y-%m-%d')
+              step    = timedelta(days=399)
+              page    = 0
 
-          # ── Transfer Price formula ───────────────────────────────────────────
-          # approxCDD per day = new BTC mined that day × price
-          # transferPrice     = Σ(approxCDD) / SplyCur_latest
-          # terminalPrice     = transferPrice × 21
-          # balancedPrice     = realizedPrice - transferPrice
+              while current <= end_dt:
+                  chunk_end = min(current + step, end_dt)
+                  url = ('https://api.blockchair.com/bitcoin/blocks'
+                         '?a=date,sum(cdd_total)'
+                         '&q=time(' + current.strftime('%Y-%m-%d') + '..'
+                                    + chunk_end.strftime('%Y-%m-%d') + ')'
+                         '&s=date(asc)&limit=400')
+                  try:
+                      with urlopen(url, timeout=30) as r:
+                          body = json.loads(r.read().decode())
+                      rows = body.get('data', [])
+                      for row in rows:
+                          d   = row.get('date', '')
+                          cdd = float(row.get('sum(cdd_total)') or 0)
+                          if d:
+                              cdd_by_date[d] = cdd
+                      page += 1
+                      print(f'Blockchair page {page}: {len(rows)} rows '
+                            f'({current.strftime("%Y-%m-%d")} .. {chunk_end.strftime("%Y-%m-%d")})')
+                      time.sleep(0.5)   # polite delay
+                  except HTTPError as e:
+                      print(f'Blockchair HTTP {e.code} for range '
+                            f'{current.strftime("%Y-%m-%d")}..{chunk_end.strftime("%Y-%m-%d")}: {e}')
+                      if e.code in (429, 430):
+                          print('Rate-limited — aborting Blockchair fetch')
+                          return None
+                  except Exception as e:
+                      print(f'Blockchair error: {e}')
+                      return None
+                  current = chunk_end + timedelta(days=1)
 
+              print(f'Blockchair CDD total: {len(cdd_by_date)} dates')
+              return cdd_by_date
+
+          # ── Fetch CoinMetrics ────────────────────────────────────────────
+          cm_map = fetch_cm()
+
+          # ── Try Blockchair CDD first ─────────────────────────────────────
+          print('Trying Blockchair for CDD data...')
+          cdd_map = fetch_blockchair_cdd()
+          use_cdd = cdd_map is not None and len(cdd_map) > 100
+
+          if use_cdd:
+              print(f'Using Blockchair CDD ({len(cdd_map)} dates)')
+          else:
+              print('Blockchair unavailable — falling back to issuance-weighted approximation')
+
+          # ── Compute transfer price ───────────────────────────────────────
+          dates = sorted(cm_map.keys())
           result = []
-          cumulative_issuance_value = 0.0   # Σ(daily_new_BTC × price) in USD
-          prev_sply = None
 
-          for row in rows:
-              d     = row.get('time', '')[:10]
-              price = float(row.get('PriceUSD') or 0)
-              sply  = float(row.get('SplyCur')  or 0)
-              mvrv  = float(row.get('CapMVRVCur') or 0)
+          if use_cdd:
+              # CDD-weighted average price: Σ(CDD × price) / Σ(CDD)
+              cum_cdd_value = 0.0
+              cum_cdd       = 0.0
+              for d in dates:
+                  cm  = cm_map[d]
+                  cdd = float(cdd_map.get(d) or 0)
+                  cum_cdd_value += cdd * cm['price']
+                  cum_cdd       += cdd
+                  if cum_cdd <= 0:
+                      continue
+                  transfer_price = cum_cdd_value / cum_cdd
+                  terminal_price = transfer_price * 21
+                  realized_price = cm['price'] / cm['mvrv']
+                  balanced_price = realized_price - transfer_price
+                  unix_ts = int(datetime.strptime(d, '%Y-%m-%d')
+                                .replace(tzinfo=timezone.utc).timestamp())
+                  result.append({
+                      'd':             d,
+                      'unixTs':        str(unix_ts),
+                      'price':         round(cm['price'],     2),
+                      'realizedPrice': round(realized_price,  2),
+                      'transferPrice': round(transfer_price,  2),
+                      'terminalPrice': round(terminal_price,  2),
+                      'balancedPrice': round(balanced_price,  2),
+                      'source':        'cdd',
+                  })
+          else:
+              # Fallback: issuance-weighted (underestimates ~3x vs real CDD)
+              cum_issuance_value = 0.0
+              prev_sply          = None
+              for d in dates:
+                  cm   = cm_map[d]
+                  sply = cm['sply']
+                  daily_issuance = (sply - prev_sply) if prev_sply is not None else sply
+                  if daily_issuance < 0:
+                      daily_issuance = 0
+                  cum_issuance_value += daily_issuance * cm['price']
+                  prev_sply = sply
+                  transfer_price = cum_issuance_value / sply
+                  terminal_price = transfer_price * 21
+                  realized_price = cm['price'] / cm['mvrv']
+                  balanced_price = realized_price - transfer_price
+                  unix_ts = int(datetime.strptime(d, '%Y-%m-%d')
+                                .replace(tzinfo=timezone.utc).timestamp())
+                  result.append({
+                      'd':             d,
+                      'unixTs':        str(unix_ts),
+                      'price':         round(cm['price'],     2),
+                      'realizedPrice': round(realized_price,  2),
+                      'transferPrice': round(transfer_price,  2),
+                      'terminalPrice': round(terminal_price,  2),
+                      'balancedPrice': round(balanced_price,  2),
+                      'source':        'issuance-approx',
+                  })
 
-              if not d or price <= 0 or sply <= 0 or mvrv <= 0:
-                  prev_sply = sply if sply > 0 else prev_sply
-                  continue
-
-              # New BTC mined today (genesis day: full SplyCur counts as issuance)
-              daily_issuance = sply - prev_sply if prev_sply is not None else sply
-              if daily_issuance < 0:
-                  daily_issuance = 0   # supply never decreases; guard against any data gap
-
-              cumulative_issuance_value += daily_issuance * price
-              prev_sply = sply
-
-              transfer_price  = cumulative_issuance_value / sply
-              terminal_price  = transfer_price * 21
-              realized_price  = price / mvrv
-              balanced_price  = realized_price - transfer_price
-
-              unix_ts = int(datetime.strptime(d, '%Y-%m-%d')
-                            .replace(tzinfo=timezone.utc).timestamp())
-
-              result.append({
-                  'd':             d,
-                  'unixTs':        str(unix_ts),
-                  'price':         round(price,          2),
-                  'realizedPrice': round(realized_price, 2),
-                  'transferPrice': round(transfer_price, 2),
-                  'terminalPrice': round(terminal_price, 2),
-                  'balancedPrice': round(balanced_price, 2),
-              })
-
-          print(f'Computed {len(result)} records')
+          print(f'Computed {len(result)} records  (source: {"cdd" if use_cdd else "issuance-approx"})')
           if result:
               for r in result[-5:]:
                   print(f"  {r['d']}  price={r['price']}  realized={r['realizedPrice']}  "
