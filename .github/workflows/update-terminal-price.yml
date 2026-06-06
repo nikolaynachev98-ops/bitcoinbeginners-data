@@ -156,16 +156,18 @@ jobs:
 
           transfer_data  = fetch_all('transfer-price')
           cdd_data       = sorted(fetch_all('cdd'), key=lambda r: r['d'])
+          terminal_data  = fetch_all('terminal-price')
           price_map      = fetch_prices()
           transfer_map   = compute_transfer_prices(transfer_data, cdd_data, price_map)
+          terminal_map   = {row['d']: row for row in terminal_data if row.get('d')}
 
-          all_dates    = set(existing)
+          all_dates    = set(existing) | set(terminal_map)
 
           result = []
           last_transfer = None
           for d in sorted(all_dates):
               prev = existing.get(d, {})
-              term = {}
+              term = terminal_map.get(d, {})
               # Update running transfer price when new data is available
               if d in transfer_map:
                   last_transfer = transfer_map[d]
