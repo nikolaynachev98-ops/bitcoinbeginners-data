@@ -1,0 +1,109 @@
+name: Update Bitcoin Cycle Prices
+
+on:
+  schedule:
+    - cron: '15 0 * * *'  # Daily at 00:15 UTC
+  workflow_dispatch:
+
+jobs:
+  update-data:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Compute cycle prices (100% CoinMetrics community, no external deps)
+        run: |
+          python3 << 'PYEOF'
+          import json
+          from urllib.request import urlopen
+          from datetime import datetime, timezone
+
+          # ── CoinMetrics community: PriceUSD + SplyCur + CapMVRVCur ─────────
+          # All three metrics are in the free community tier.
+          # Realized Price = PriceUSD / CapMVRVCur (no CapRealUSD needed).
+          def fetch_cm():
+              base = ('https://community-api.coinmetrics.io/v4/timeseries/asset-metrics'
+                      '?assets=btc&metrics=PriceUSD,SplyCur,CapMVRVCur'
+                      '&frequency=1d&start_time=2010-01-01&page_size=10000')
+              rows = []
+              url = base
+              while url:
+                  with urlopen(url, timeout=60) as r:
+                      body = json.loads(r.read().decode())
+                  rows.extend(body.get('data', []))
+                  url = body.get('next_page_url')
+              print(f'CoinMetrics: {len(rows)} rows')
+              return rows
+
+          rows = fetch_cm()
+
+          # ── Transfer Price formula ───────────────────────────────────────────
+          # approxCDD per day = new BTC mined that day × price
+          # transferPrice     = Σ(approxCDD) / SplyCur_latest
+          # terminalPrice     = transferPrice × 21
+          # balancedPrice     = realizedPrice - transferPrice
+
+          result = []
+          cumulative_issuance_value = 0.0   # Σ(daily_new_BTC × price) in USD
+          prev_sply = None
+
+          for row in rows:
+              d     = row.get('time', '')[:10]
+              price = float(row.get('PriceUSD') or 0)
+              sply  = float(row.get('SplyCur')  or 0)
+              mvrv  = float(row.get('CapMVRVCur') or 0)
+
+              if not d or price <= 0 or sply <= 0 or mvrv <= 0:
+                  prev_sply = sply if sply > 0 else prev_sply
+                  continue
+
+              # New BTC mined today (genesis day: full SplyCur counts as issuance)
+              daily_issuance = sply - prev_sply if prev_sply is not None else sply
+              if daily_issuance < 0:
+                  daily_issuance = 0   # supply never decreases; guard against any data gap
+
+              cumulative_issuance_value += daily_issuance * price
+              prev_sply = sply
+
+              transfer_price  = cumulative_issuance_value / sply
+              terminal_price  = transfer_price * 21
+              realized_price  = price / mvrv
+              balanced_price  = realized_price - transfer_price
+
+              unix_ts = int(datetime.strptime(d, '%Y-%m-%d')
+                            .replace(tzinfo=timezone.utc).timestamp())
+
+              result.append({
+                  'd':             d,
+                  'unixTs':        str(unix_ts),
+                  'price':         round(price,          2),
+                  'realizedPrice': round(realized_price, 2),
+                  'transferPrice': round(transfer_price, 2),
+                  'terminalPrice': round(terminal_price, 2),
+                  'balancedPrice': round(balanced_price, 2),
+              })
+
+          print(f'Computed {len(result)} records')
+          if result:
+              for r in result[-5:]:
+                  print(f"  {r['d']}  price={r['price']}  realized={r['realizedPrice']}  "
+                        f"transfer={r['transferPrice']}  terminal={r['terminalPrice']}  "
+                        f"balanced={r['balancedPrice']}")
+
+          with open('cycle-prices.json', 'w') as f:
+              json.dump(result, f, separators=(',', ':'))
+
+          print('Saved cycle-prices.json')
+          PYEOF
+
+      - name: Commit and push
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add cycle-prices.json
+          git diff --staged --quiet || git commit -m "Update cycle prices $(date -u +%Y-%m-%d)"
+          git push
