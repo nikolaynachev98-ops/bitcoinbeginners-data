@@ -77,16 +77,14 @@ jobs:
           # Transfer Price[t] = Σ_{genesis → t}(CDD_d × Price_d) / SplyCur[t] / Age[t]
 
           all_dates     = sorted(set(list(cdd_map.keys()) + list(cm_map.keys())))
-          cum_cdd_value = 0.0
-          result        = []
+          cum_cdd = 0.0
+          result  = []
 
           for d in all_dates:
-              cdd   = cdd_map.get(d, 0.0)
-              cm    = cm_map.get(d)
+              cdd = cdd_map.get(d, 0.0)
+              cm  = cm_map.get(d)
 
-              # Accumulate price-weighted CDD (price = 0 before exchange era → no effect)
-              price_for_cdd = cm['price'] if cm else 0.0
-              cum_cdd_value += cdd * price_for_cdd
+              cum_cdd += cdd
 
               if not cm:
                   continue   # no price/supply data for this date — skip output row
@@ -96,7 +94,7 @@ jobs:
               if age_days <= 0 or cm['sply'] <= 0:
                   continue
 
-              transfer_price = cum_cdd_value / cm['sply'] / age_days
+              transfer_price = cum_cdd / cm['sply'] / age_days
               realized_price = cm['price'] / cm['mvrv']
 
               unix_ts = int(datetime(d_date.year, d_date.month, d_date.day,
