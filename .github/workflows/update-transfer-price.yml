@@ -1,8 +1,6 @@
 name: Update Bitcoin Transfer Price
 
 on:
-  schedule:
-    - cron: '1 0 * * *'  # Daily at 00:01 UTC (03:01 AM Bulgaria/EEST)
   workflow_dispatch:
 
 jobs:
